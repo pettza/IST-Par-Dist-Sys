@@ -59,7 +59,7 @@ sparse_mat parse_file(const char* filename)
 	sparse_mat A(nU);
 	for (int i = 0; i < n_elems; i++)
 	{
-		int row, col;
+		int row, col;           //Can this be done outside the for-loop?
 		double elem;
 
 		file >> row >> col >> elem;
