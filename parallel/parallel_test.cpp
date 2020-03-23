@@ -81,7 +81,6 @@ double learning_rate;
 void random_fill_matrix(matrix& m)
 {
     std::cout << omp_get_thread_num();
-    std::srand(0);
     
     for (int r = 0; r < m.n_rows; r++)
         for (int c = 0; c < m.n_columns; c++)
@@ -186,6 +185,7 @@ void result(const sparse_matrix& A, const matrix& L, const matrix& R)
 
 int main(int argc, char** argv)
 {
+    std::srand(0);
     sparse_matrix A = parse_file(argv[1]);
     matrix L(nU, nF);
     matrix oldL(nU, nF);
