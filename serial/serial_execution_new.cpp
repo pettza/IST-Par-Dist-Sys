@@ -77,7 +77,7 @@ double learning_rate;
 
 
 #define RAND01 ((double) std::rand() / (double) RAND_MAX)
-std::srand(0);
+
 
 void random_fill_matrix(matrix& m)
 {
@@ -186,6 +186,7 @@ void result(const sparse_matrix& A, const matrix& L, const matrix& R)
 
 int main(int argc, char** argv)
 {
+    std::srand(0);
     sparse_matrix A = parse_file(argv[1]);
     matrix L(nU, nF);
     matrix oldL(nU, nF);
