@@ -77,10 +77,10 @@ double learning_rate;
 
 
 #define RAND01 ((double) std::rand() / (double) RAND_MAX)
+std::srand(0);
 
 void random_fill_matrix(matrix& m)
 {
-    std::srand(0);
     
     for (int r = 0; r < m.n_rows; r++)
         for (int c = 0; c < m.n_columns; c++)
