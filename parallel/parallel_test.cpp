@@ -81,16 +81,16 @@ double learning_rate;
 void random_fill_matrix(matrix& m)
 {
     int tid = omp_get_thread_num();
-    std::cout << tid;
+    std::cout << "\nNum_thread: " << tid << "\n";
     
     for (int r = 0; r < m.n_rows; r++) {
         for (int c = 0; c < m.n_columns; c++) {
-            printf("Thread: %d\trow=%d\tcol=%d\n", tid, r, c);  fflush(stdout);
+    //        printf("Thread: %d\trow=%d\tcol=%d\n", tid, r, c);  fflush(stdout);
             m[r][c] = RAND01 / (double) nF;
         }
     }
-    printf("Thread %d, almost..\n", tid);  fflush(stdout);
-    printf("Thread %d, done!\n", tid);  fflush(stdout);
+    //printf("Thread %d, almost..\n", tid);  fflush(stdout);
+    //printf("Thread %d, done!\n", tid);  fflush(stdout);
 }
 
 
