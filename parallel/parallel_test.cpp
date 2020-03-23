@@ -201,6 +201,7 @@ int main(int argc, char** argv)
         random_fill_matrix(R);
     }
     
+#pragma omp parallel for
     for (int i = 0; i < n_iter; i++) update_LR(A, L, R, oldL, oldR);
     
     result(A, L, R);
