@@ -165,7 +165,7 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
             }
         }
 
-        #pragma omp for
+        #pragma omp for schedule(dynamic, 10)
         for (int j = 0; j < nI; j++)
         {
             int i;
