@@ -4,28 +4,35 @@
 #include <iostream>
 #include <omp.h>
 
+constexpr int cache_line = 64 / sizeof(double);
 
 /** Matrix type
  */
 class matrix
 {
 public:
-    using row_t = std::vector<double>;
-    
     matrix(int n_rows, int n_columns)
-    : n_rows(n_rows), n_columns(n_columns), data(n_rows, row_t(n_columns))
+    : n_rows(n_rows), n_columns(n_columns),
+      row_size((n_columns / cache_line + 1) * cache_line),
+      data(n_rows * row_size)
     {}
     
-    row_t& operator[](int row) { return data[row]; }
+    double& operator()(int row, int col) { return data[row * row_size + col]; }
     
-    const row_t& operator[](int row) const { return data[row]; }
+    double operator()(int row, int col) const { return data[row * row_size + col]; }
     
+    matrix& operator=(const matrix& m)
+    {
+        std::copy(m.data.begin(), m.data.end(), this->data.begin());
+        return *this;
+    }
+
     friend std::ostream& operator<<(std::ostream& s, const matrix& m)
     {
         for (int r = 0; r < m.n_rows; r++)
         {
             for (int c = 0; c < m.n_columns; c++)
-                s << m[r][c] << '\t';
+                s << m(r, c) << '\t';
             s << '\n';
         }
         
@@ -34,9 +41,10 @@ public:
 
 public:
     int n_rows, n_columns;
+    int row_size;
     
 private:
-    std::vector<row_t> data;
+    std::vector<double> data;
 };
 
 
@@ -118,7 +126,7 @@ double B(int i, int j, const matrix& L, const matrix& Rt)
 {
     double elem = .0;
     for(int k = 0; k < nF; k++) {
-        elem += L[i][k]*Rt[j][k];
+        elem += L(i, k)*Rt(j, k);
     }
     return elem;
 }
@@ -152,13 +160,13 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
                 temp = rating - B(i, j, oldL, oldRt);
                 for (int k = 0; k < nF; k++)
                 {
-                    deltaL = -2 * temp * oldRt[j][k];
-                    L[i][k] -= learning_rate * deltaL;
+                    deltaL = -2 * temp * oldRt(j, k);
+                    L(i, k) -= learning_rate * deltaL;
                 }
             }
         }
 
-        #pragma omp for
+        #pragma omp for schedule(dynamic, 10)
         for (int j = 0; j < nI; j++)
         {
             int i;
@@ -170,8 +178,8 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
                 temp = rating - B(i, j, oldL, oldRt);
                 for (int k = 0; k < nF; k++)
                 {
-                    deltaR = -2 * temp * oldL[i][k];
-                    Rt[j][k] -= learning_rate * deltaR;
+                    deltaR = -2 * temp * oldL(i, k);
+                    Rt(j, k) -= learning_rate * deltaR;
                 }
             }
         }
@@ -220,13 +228,15 @@ int main(int argc, char** argv)
     
     for (int r = 0; r < nU; r++)
         for (int c = 0; c < nF; c++)
-            L[r][c] = RAND01 / (double) nF;
+            L(r, c) = RAND01 / (double) nF;
 
     for (int r = 0; r < nF; r++)
         for (int c = 0; c < nI; c++)
-            Rt[c][r] = RAND01 / (double) nF;
+            Rt(c, r) = RAND01 / (double) nF;
 
-    for (int i = 0; i < n_iter; i++) update_LR(A, L, Rt, oldL, oldRt);
+    for (int i = 0; i < n_iter; i++){
+        update_LR(A, L, Rt, oldL, oldRt);
+    }
         
     //std::cout << "L:\n" << L << "\nR:\n" << Rt;
 
