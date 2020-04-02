@@ -8,7 +8,7 @@ default: matFact-omp
 opt: CXXFLAGS += -O2
 opt: matFact-omp
 
-kinst: CXX := kinst ompp $(CXX)
+kinst: CXX := kinst-ompp $(CXX)
 kinst: matFact-omp
 
 matFact-omp: matFact-omp.cpp
