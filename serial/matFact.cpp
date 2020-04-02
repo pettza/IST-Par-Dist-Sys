@@ -57,8 +57,8 @@ public:
 
     matrix& operator=(const matrix& m) 
     {
-        for (int i = 0; i < data.size(); i++)
-            this->data[i] = m.data[i];
+        std::copy(m.data.begin(), m.data.end(), this->data.begin());
+        return *this;
     }
 
     friend std::ostream& operator<<(std::ostream& s, const matrix& m)
