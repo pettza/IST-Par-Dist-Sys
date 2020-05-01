@@ -9,6 +9,7 @@ constexpr int GlobalsTag = 0;
 constexpr int SizeTag = 0;
 constexpr int DataTag = 0;
 
+constexpr int cache_line = 64 / sizeof(double);
 
 // globals
 struct {
@@ -18,6 +19,8 @@ int nU;
 int nI;
 double learning_rate;
 } globals;
+
+int id, p;
 
 /** Sparse matrix type
  */
@@ -41,6 +44,53 @@ public:
     std::vector<entry_t> elements;
 };
 
+/** Matrix type
+ */
+class matrix
+{
+public:
+    matrix(int n_rows, int n_columns)
+    : n_rows(n_rows), n_columns(n_columns),
+      row_size((n_columns / cache_line + 1) * cache_line),
+      data(n_rows * row_size)
+    {}
+
+    double& operator()(int row, int col) { return data[row * row_size + col]; }
+    
+    double operator()(int row, int col) const { return data[row * row_size + col]; }
+
+    matrix& operator=(const matrix& m) 
+    {
+        std::copy(m.data.begin(), m.data.end(), this->data.begin());
+        return *this;
+    }
+
+    friend std::ostream& operator<<(std::ostream& s, const matrix& m)
+    {
+        for (int r = 0; r < m.n_rows; r++)
+        {
+            for (int c = 0; c < m.n_columns; c++)
+                s << m(r, c) << '\t';
+            s << '\n';
+        }
+        
+        return s;
+    }
+	
+	friend void swap(matrix a, matrix b)
+	{
+		std::swap(a.n_rows, b.n_rows);
+		std::swap(a.n_columns, b.n_columns);
+		std::swap(a.row_size, b.row_size);
+		std::swap(a.data, b.data);
+	}
+
+public:
+    int n_rows, n_columns;
+    int row_size;
+    
+    std::vector<double> data;
+};
 
 struct sparse_data
 {
@@ -49,7 +99,7 @@ struct sparse_data
 };
 
 // Creates a matrix from a file
-sparse_matrix parse_file_send_data(const char* filename, int nP)
+int parse_file_send_data(const char* filename, sparse_matrix& A)
 {
     std::ifstream file(filename);
     
@@ -66,8 +116,8 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
     file >> globals.nF;
     file >> globals.nU >> globals.nI >> n_elems;
 	
-	int rows_per_proc = globals.nU / nP;
-	int extra_rows = globals.nU % nP;
+	int rows_per_proc = globals.nU / p;
+	int extra_rows = globals.nU % p;
 	
 	int row = 0, col = 0;
     double elem;
@@ -75,18 +125,14 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
 	int n_rows = 0;
 	int rows_to_send = rows_per_proc + (extra_rows == 0 ? 0 : 1);
 	int id = 0;
-    sparse_matrix A;
     for (int i = 0; i < n_elems; i++)
     {
 		int prev_row = row;
 		
         file >> row >> col >> elem;
-		
-		std::cout << "Row: " << row << ", Column: " << col << ", Element: " << elem << std::endl;
-		
+
 		if (prev_row != row)
 		{
-			std::cout << "New Row!" << std::endl;
 			n_rows += row - prev_row;
 			
 			if (n_rows >= rows_to_send)
@@ -95,8 +141,6 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
 				{
 					int size[] = {(int) sendingData.size(), rows_to_send};
 					
-					std::cout << "Sending data to processor " << id << std::endl;
-					
 					MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
 					if (size[0] != 0) MPI_Send(sendingData.data(), size[0] * sizeof(sparse_data), MPI_BYTE, id, DataTag, MPI_COMM_WORLD);
 				}
@@ -104,7 +148,7 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
 				sendingData.clear();
 				n_rows -= rows_to_send ;
 				id++;
-				rows_to_send = rows_per_proc + (id > extra_rows ? 0 : 1);
+				rows_to_send = rows_per_proc + (id >= extra_rows ? 0 : 1);
 			}
         }
 		
@@ -114,8 +158,6 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
     
 	//Send to last processors
 	int size[] = {(int) sendingData.size(), rows_to_send};
-					
-	std::cout << "Sending data to processor " << id << std::endl;
 	
 	MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
 	if (size[0] != 0) MPI_Send(sendingData.data(), size[0] * sizeof(sparse_data), MPI_BYTE, id, DataTag, MPI_COMM_WORLD);
@@ -123,17 +165,123 @@ sparse_matrix parse_file_send_data(const char* filename, int nP)
 	id++;
 	size[0] = 0;
 	size[1] = 0;
-	for (; id < nP; id++) MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
+	for (; id < p; id++) MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
 
     file.close();
     
-    return A;
+    return rows_per_proc + (extra_rows == 0 ? 0 : 1);
 }
 
+// Calculate B_ij
+double B(int i, int j, const matrix& L, const matrix& Rt)
+{
+    double elem = .0;
+    for(int k = 0; k < globals.nF; k++) {
+        elem += L(i, k)*Rt(j, k);
+    }
+    return elem;
+}
+
+void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matrix& oldRt)
+{
+    swap(L, oldL);
+    swap(Rt, oldRt);
+	
+	for (int i = 0; i < L.n_rows; ++i)
+		for (int j = 0; j < L.n_columns; ++j)
+			L(i, j) = 0;
+
+	for (int i = 0; i < Rt.n_rows; ++i)
+		for (int j = 0; j < Rt.n_columns; ++j)
+			Rt(i, j) = 0;
+    
+	float deltaL, deltaR, temp;
+    for (auto& entry : A.elements)
+    {
+		if (entry.row >= L.n_rows) break;
+		
+        temp = entry.rating - B(entry.row, entry.col, oldL, oldRt);
+        for (int k = 0; k < globals.nF; k++)
+        {
+            deltaL = -2 * temp * oldRt(entry.col, k);
+            L(entry.row, k) -= globals.learning_rate * deltaL;
+
+            deltaR = -2 * temp * oldL(entry.row, k);
+            Rt(entry.col, k) -= globals.learning_rate * deltaR;
+        }
+    }
+}
+
+void exchangeRt(matrix& Rt, double* buffer)
+{
+	MPI_Request request;
+	MPI_Status status;
+	int size = Rt.n_rows * Rt.row_size;
+	
+	for (int neighbor_mask = 0b1; neighbor_mask < p; neighbor_mask <<= 1)
+	{
+		int neighbor_id = (id & ~neighbor_mask) | (~id & neighbor_mask);
+
+		MPI_Isend(Rt.data.data(), size, MPI_DOUBLE, neighbor_id, DataTag, MPI_COMM_WORLD, &request);
+		MPI_Recv(buffer, size, MPI_DOUBLE, neighbor_id, DataTag, MPI_COMM_WORLD, &status);
+		MPI_Wait(&request, &status);
+		
+		for (int i = 0; i < size; ++i) Rt.data[i] += buffer[i];
+	}
+}
+
+void gatherL(matrix& FullL, matrix& L)
+{
+	int* proc_rows = new int[p];
+	int* proc_offsets = new int[p];
+	int rows_per_proc = globals.nU / p;
+	int extra_rows = globals.nU % p;
+	
+	proc_rows[0] = (rows_per_proc + (extra_rows == 0 ? 0 : 1)) * L.row_size;
+	proc_offsets[0] = 0;
+	for (int id = 1; id < p; ++id)
+	{
+		proc_rows[id] = (rows_per_proc + (id >= extra_rows ? 0 : 1)) * L.row_size;
+		proc_offsets[id] = proc_rows[id-1] + proc_offsets[id-1];
+	}
+	
+	int size = L.n_rows * L.row_size;
+	MPI_Gatherv(L.data.data(), size, MPI_DOUBLE, FullL.data.data(), proc_rows, proc_offsets, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+}
+
+void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
+{
+    double max;
+    int col;
+    auto it = A.elements.begin();
+    auto it_end = A.elements.end();
+    
+    for(int i = 0; i < globals.nU; i++) {
+        max = 0;
+        col = 0;
+        bool finished_row = (it == it_end || it->row > i);
+
+        for(int j = 0; j < globals.nI; j++) {
+            if (!finished_row && j == it->col)
+            {
+                it++;
+                finished_row = (it == it_end || it->row > i);
+                continue;
+            }
+            
+            double b = B(i,j, L, Rt);
+            if (b > max) {
+                max = b;
+                col = j;
+            }
+        }
+        std::cout << col << "\n";
+    }
+}
 
 int main(int argc, char* argv[])
 {
-	int id, p;
+	int n_rows;
 	sparse_matrix A;
 	
 	MPI_Init(&argc, &argv);
@@ -141,12 +289,14 @@ int main(int argc, char* argv[])
 	MPI_Comm_rank(MPI_COMM_WORLD, &id);
     MPI_Comm_size(MPI_COMM_WORLD, &p);
 	
-	if (id == 0) A = parse_file_send_data(argv[1], p);
+	if (id == 0) n_rows = parse_file_send_data(argv[1], A);
 	else
 	{
 		MPI_Status status;
 		int size[2];
 		MPI_Recv(size, 2, MPI_INT, 0, SizeTag, MPI_COMM_WORLD, &status);
+		
+		n_rows = size[1];
 		
 		sparse_data* buffer;
 		
@@ -163,14 +313,48 @@ int main(int argc, char* argv[])
 				A.add_element(buffer[i].row - offset, buffer[i].col, buffer[i].elem);
 			}
 			
-			std::cout << "Processor " << id << " received data" << std::endl;
-			
 			delete[] buffer;
 		}
 	}
 	
+	
 	//Send globals
 	MPI_Bcast(&globals, sizeof(globals), MPI_BYTE, 0, MPI_COMM_WORLD);
+    
+	matrix L(n_rows, globals.nF);
+    matrix oldL(n_rows, globals.nF);
+    matrix Rt(globals.nI, globals.nF);
+    matrix oldRt(globals.nI, globals.nF);
+	double* bufferRt = new double[Rt.n_rows * Rt.row_size];
+	
+	#define RAND01 ((double) std::rand() / (double) RAND_MAX)
+
+	for (int r = 0; r < n_rows; r++)
+		for (int c = 0; c < globals.nF; c++)
+			L(r, c) = RAND01 / (double) globals.nF;
+
+	for (int r = 0; r < globals.nF; r++)
+		for (int c = 0; c < globals.nI; c++)
+			Rt(c, r) = RAND01 / (double) globals.nF;
+	
+	for (int i = 0; i < globals.n_iter; i++)
+	{
+		update_LR(A, L, Rt, oldL, oldRt);
+		
+		exchangeRt(Rt, bufferRt);
+		
+		for (int i = 0; i < Rt.n_rows; ++i)
+			for (int j = 0; j < Rt.n_columns; ++j)
+				Rt(i, j) += oldRt(i, j);
+	}
+	
+	matrix FullL(globals.nU, globals.nF);
+	
+	gatherL(FullL, L);
+
+	if (id == 0) result(A, FullL, Rt);
+	
+	delete[] bufferRt;
 	
 	MPI_Finalize();
 	
