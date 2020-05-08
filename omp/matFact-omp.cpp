@@ -20,6 +20,10 @@ public:
     double& operator()(int row, int col) { return data[row * row_size + col]; }
     
     double operator()(int row, int col) const { return data[row * row_size + col]; }
+	
+	double* getRow(int row) { return data.data() + row * row_size; }
+	
+	const double* getRow(int row) const { return data.data() + row * row_size; }
     
     matrix& operator=(const matrix& m)
     {
@@ -125,8 +129,10 @@ sparse_matrix parse_file(const char* filename)
 double B(int i, int j, const matrix& L, const matrix& Rt)
 {
     double elem = .0;
+	const double* Li = L.getRow(i);
+	const double* Rtj = Rt.getRow(j);
     for(int k = 0; k < nF; k++) {
-        elem += L(i, k)*Rt(j, k);
+        elem += Li[k] * Rtj[k];
     }
     return elem;
 }
@@ -153,15 +159,18 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
         {
             int j;
             auto& row = A.rows[i];
+			double* Li = L.getRow(i);
+			double* oldRtj;
             for (auto& c : row)
             {
                 double rating = A.elements[c.elem_idx];
                 j = c.idx;
+				oldRtj = oldRt.getRow(j);
                 temp = rating - B(i, j, oldL, oldRt);
                 for (int k = 0; k < nF; k++)
                 {
-                    deltaL = -2 * temp * oldRt(j, k);
-                    L(i, k) -= learning_rate * deltaL;
+					deltaL = -2 * temp * oldRtj[k];
+					Li[k] -= learning_rate * deltaL;
                 }
             }
         }
@@ -171,15 +180,18 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
         {
             int i;
             auto& col = A.columns[j];
+			double* Rtj = Rt.getRow(j);
+			double* oldLi;
             for (auto& r : col)
             {
                 double rating = A.elements[r.elem_idx];
                 i = r.idx;
+				oldLi = oldL.getRow(i);
                 temp = rating - B(i, j, oldL, oldRt);
                 for (int k = 0; k < nF; k++)
                 {
-                    deltaR = -2 * temp * oldL(i, k);
-                    Rt(j, k) -= learning_rate * deltaR;
+					deltaR = -2 * temp * oldLi[k];
+					Rtj[k] -= learning_rate * deltaR;
                 }
             }
         }

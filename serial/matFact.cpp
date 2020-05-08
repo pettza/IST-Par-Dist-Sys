@@ -55,6 +55,10 @@ public:
     
     double operator()(int row, int col) const { return data[row * row_size + col]; }
 
+	double* getRow(int row) { return data.data() + row * row_size; }
+	
+	const double* getRow(int row) const { return data.data() + row * row_size; }
+	
     matrix& operator=(const matrix& m) 
     {
         std::copy(m.data.begin(), m.data.end(), this->data.begin());
@@ -127,8 +131,10 @@ sparse_matrix parse_file(const char* filename)
 double B(int i, int j, const matrix& L, const matrix& Rt)
 {
     double elem = .0;
+	const double* Li = L.getRow(i);
+	const double* Rtj = Rt.getRow(j);
     for(int k = 0; k < nF; k++) {
-        elem += L(i, k)*Rt(j, k);
+        elem += Li[k] * Rtj[k];
     }
     return elem;
 }
@@ -142,13 +148,17 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
     for (auto& entry : A.elements)
     {
         temp = entry.rating - B(entry.row, entry.col, oldL, oldRt);
-        for (int k = 0; k < nF; k++)
+        double* Li = L.getRow(entry.row);
+		double* Rtj = Rt.getRow(entry.col);
+		double* oldLi = oldL.getRow(entry.row);
+		double* oldRtj = oldRt.getRow(entry.col);
+		for (int k = 0; k < nF; k++)
         {
-            deltaL = -2 * temp * oldRt(entry.col, k);
-            L(entry.row, k) -= learning_rate * deltaL;
+            deltaL = -2 * temp * oldRtj[k];
+            Li[k] -= learning_rate * deltaL;
 
-            deltaR = -2 * temp * oldL(entry.row, k);
-            Rt(entry.col, k) -= learning_rate * deltaR;
+            deltaR = -2 * temp * oldLi[k];
+            Rtj[k] -= learning_rate * deltaR;
         }
     }
 }
