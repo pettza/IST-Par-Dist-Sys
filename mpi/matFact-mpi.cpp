@@ -158,12 +158,15 @@ int parse_file_distribute_A(const char* filename, sparse_matrix& A)
         sendingData.push_back({row, col, elem});
 		A.add_element(row, col, elem);
     }
-    
+	
 	//Send to last processors
 	int size[] = {(int) sendingData.size(), rows_to_send};
 	
-	MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
-	if (size[0] != 0) MPI_Send(sendingData.data(), size[0] * sizeof(sparse_matrix::entry_t), MPI_BYTE, id, DataTag, MPI_COMM_WORLD);
+	if (id != 0)
+	{
+		MPI_Send(size, 2, MPI_INT, id, SizeTag, MPI_COMM_WORLD);
+		if (size[0] != 0) MPI_Send(sendingData.data(), size[0] * sizeof(sparse_matrix::entry_t), MPI_BYTE, id, DataTag, MPI_COMM_WORLD);
+	}
 	
 	id++;
 	size[0] = 0;
@@ -215,6 +218,22 @@ void exchangeRt(matrix& Rt, double* buffer)
 	MPI_Status status;
 	int size = Rt.n_rows * Rt.row_size;
 	
+/* 	if (id != 0)
+	{
+		MPI_Recv(buffer, size, MPI_DOUBLE, id-1, DataTag, MPI_COMM_WORLD, &status);
+	}
+	
+	// Update Rt before sending to next processor
+	for (int i = 0; i < size; ++i) Rt.data[i] += buffer[i];
+	
+	if (id != p-1)
+	{
+		MPI_Send(Rt.data.data(), size, MPI_DOUBLE, id+1, DataTag, MPI_COMM_WORLD);
+	}
+ */	
+ 
+/* 	MPI_Bcast(Rt.data.data(), size, MPI_DOUBLE, p-1, MPI_COMM_WORLD);
+	
 	// Exchange messages in hypercube topology
 	for (int neighbor_mask = 0b1; neighbor_mask < p; neighbor_mask <<= 1)
 	{
@@ -227,6 +246,10 @@ void exchangeRt(matrix& Rt, double* buffer)
 		// Update Rt before sending to next naighbor
 		for (int i = 0; i < size; ++i) Rt.data[i] += buffer[i];
 	}
+*/
+	
+	MPI_Allreduce(Rt.data.data(), buffer, size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+	std::copy(buffer, buffer + size, Rt.data.begin());
 }
 
 void gatherL(matrix& FullL, matrix& L)
@@ -257,8 +280,10 @@ void gatherL(matrix& FullL, matrix& L)
 double B(int i, int j, const matrix& L, const matrix& Rt)
 {
     double elem = .0;
+	const double* Li = L.getRow(i);
+	const double* Rtj = Rt.getRow(j);
     for(int k = 0; k < globals.nF; k++) {
-        elem += L(i, k)*Rt(j, k);
+        elem += Li[k] * Rtj[k];
     }
     return elem;
 }
@@ -286,13 +311,13 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
 		double* Rtj = Rt.getRow(entry.col);
 		double* oldLi = oldL.getRow(entry.row);
 		double* oldRtj = oldRt.getRow(entry.col);
-		for (int k = 0; k < nF; k++)
+		for (int k = 0; k < globals.nF; k++)
         {
             deltaL = -2 * temp * oldRtj[k];
-            Li[k] -= learning_rate * deltaL;
+            Li[k] -= globals.learning_rate * deltaL;
 
             deltaR = -2 * temp * oldLi[k];
-            Rtj[k] -= learning_rate * deltaR;
+            Rtj[k] -= globals.learning_rate * deltaR;
         }
     }
 }
@@ -333,6 +358,8 @@ int main(int argc, char* argv[])
 	int n_rows;
 	sparse_matrix A;
 	double elapsed_time;
+	double Rt_comm_time = 0.;
+	double timer_tmp;
 	
 	MPI_Init(&argc, &argv);
 	
@@ -371,7 +398,6 @@ int main(int argc, char* argv[])
 		}
 	}
 	
-	
 	//Send globals
 	MPI_Bcast(&globals, sizeof(globals), MPI_BYTE, 0, MPI_COMM_WORLD);
     
@@ -387,7 +413,10 @@ int main(int argc, char* argv[])
 	{
 		update_LR(A, L, Rt, oldL, oldRt);
 		
+		timer_tmp = -MPI_Wtime();
 		exchangeRt(Rt, bufferRt);
+		timer_tmp += MPI_Wtime();
+		Rt_comm_time += timer_tmp;
 		
 		for (int i = 0; i < Rt.n_rows; ++i)
 			for (int j = 0; j < Rt.n_columns; ++j)
@@ -412,7 +441,12 @@ int main(int argc, char* argv[])
 	delete[] bufferRt;
 	
 	elapsed_time += MPI_Wtime();
-	if (id == 0) std::cout << "Elapsed time: " << elapsed_time << std::endl;
+	if (id == 0)
+	{
+		std::cout << "\n-----------------------------\n";
+		std::cout << "Elapsed time: " << elapsed_time << "\n";
+		std::cout << "Time spent exchanging Rt: " << Rt_comm_time << std::endl;
+	}
 	
 	MPI_Finalize();
 	
