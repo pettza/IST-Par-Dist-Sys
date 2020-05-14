@@ -131,12 +131,31 @@ struct sparse_element_info
 	double rating;
 };
 
+void calculate_dimesions()
+{
+	int min_diff = std::abs(nU / p - nI);
+	dimensions[0] = p;
+	dimensions[1] = 1;
+
+	for (int i = 2; i <= p; ++i) {
+		if (p % i == 0) {
+			int j = p / i;
+			int diff = std::abs(nU / j - nI / i);
+			if (diff < min_diff) {
+				diff = min_diff;
+				dimensions[0] = j;
+				dimensions[1] = i;
+			}
+		}
+	}
+}
+
 // Calculate topology and partitioning info
 void initialize_topology_info()
 {
 	// Create 2D cartesian grid
     MPI_Comm_size(MPI_COMM_WORLD, &p);
-	MPI_Dims_create(p, 2, dimensions);
+	calculate_dimesions();
 	int periodics[] = {0, 0};
 	MPI_Cart_create(MPI_COMM_WORLD, 2, dimensions, periodics, 1, &Cart_Comm);
 	MPI_Comm_rank(Cart_Comm, &id);
@@ -175,7 +194,7 @@ void initialize_partitioning_info()
 }
 
 // Creates a matrix from a file
-void parse_file(const char* filename, sparse_matrix& A)
+void parse_file_initialize_info(const char* filename, sparse_matrix& A)
 {
 	std::ifstream file(filename);
 	int n_elements;
@@ -190,6 +209,7 @@ void parse_file(const char* filename, sparse_matrix& A)
 	file >> nF;
 	file >> nU >> nI >> n_elements;
 	
+	initialize_topology_info();
 	initialize_partitioning_info();
 	
 	A.reset(proc_rows[cart_coords[0]], proc_columns[cart_coords[1]]);
@@ -402,9 +422,7 @@ int main(int argc, char* argv[])
 	MPI_Init(&argc, &argv);
 	elapsed_time = -MPI_Wtime();
 	
-	initialize_topology_info();
-	
-	parse_file(argv[1], A);
+	parse_file_initialize_info(argv[1], A);
 
 	matrix L(proc_rows[cart_coords[0]], nF);
 	matrix oldL(proc_rows[cart_coords[0]], nF);
@@ -449,6 +467,7 @@ int main(int argc, char* argv[])
 	
 	if (id == root_id) {
 		std::cout << "\n-----------------------------\n";
+		std::cout << "Dimensions: " << dimensions[0] << ' ' << dimensions[1] << '\n';
 		std::cout << "Elapsed time: " << elapsed_time << '\n';
 		std::cout << "Communication: " << comm_time << std::endl;
 	}
