@@ -1,0 +1,522 @@
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <algorithm>
+#include <mpi.h>
+#include <omp.h>
+
+constexpr int GlobalsTag = 0;
+constexpr int SizeTag = 1;
+constexpr int DataTag = 2;
+
+constexpr int cache_line = 64 / sizeof(double);
+
+// globals
+int n_iter;
+int nF;
+int nU;
+int nI;
+double learning_rate;
+int id, root_id, p;
+int dimensions[2];
+int cart_coords[2];
+std::unique_ptr<int[]> proc_rows(nullptr);
+std::unique_ptr<int[]> proc_row_offsets(nullptr);
+std::unique_ptr<int[]> proc_columns(nullptr);
+std::unique_ptr<int[]> proc_column_offsets(nullptr);
+MPI_Comm Cart_Comm;
+MPI_Comm Rows_Comm, Columns_Comm;
+
+/** Sparse matrix type
+ */
+class sparse_matrix
+{
+public:
+	sparse_matrix() = default;
+	
+	sparse_matrix(int n_rows, int n_columns, int n_elements)
+	: n_rows(n_rows), n_columns(n_columns),
+	rows(new std::vector<entry_t>[n_rows]),
+	columns(new std::vector<entry_t>[n_columns])
+	{}
+
+	void reset(int n_rows, int n_columns)
+	{
+		this->n_rows = n_rows;
+		this->n_columns = n_columns;
+		rows.reset(new std::vector<entry_t>[n_rows]);
+		columns.reset(new std::vector<entry_t>[n_columns]);
+		elements.clear();
+	}
+	
+	void add_element(int row, int column, double element)
+	{
+		int elem_idx = elements.size();
+		elements.push_back(element);
+		entry_t temp = {column, elem_idx};
+		rows[row].push_back(temp);
+		entry_t temp2 = {row, elem_idx};
+		columns[column].push_back(temp2);
+	}
+	struct entry_t
+	{
+		int idx;
+		int elem_idx;
+	};
+	
+	int n_rows, n_columns;
+	std::vector<double> elements;
+	std::unique_ptr< std::vector<entry_t>[] > rows;
+	std::unique_ptr< std::vector<entry_t>[] > columns;
+};
+
+/** Matrix type
+ */
+class matrix
+{
+public:
+	matrix(int n_rows, int n_columns)
+	: n_rows(n_rows), n_columns(n_columns),
+	row_size((n_columns / cache_line + 1) * cache_line),
+	data(new double[n_rows * row_size])
+	{}
+	
+	// matrix(const sparse_matrix& m)
+	// : n_rows(m.n_rows), n_columns(m.n_columns),
+	// row_size((n_columns / cache_line + 1) * cache_line),
+	// data(new double[n_rows * row_size])
+	// {
+	// 	for (int r = 0; r < n_rows; r++)
+	// 		for (int c = 0; c < n_columns; c++)
+	// 			(*this)(r, c) = 0;
+
+	// 	for (auto& e : m.elements)
+	// 		(*this)(e.row, e.col) = e.rating;
+	// }
+	
+	double& operator()(int row, int col) { return data[row * row_size + col]; }
+	
+	double operator()(int row, int col) const { return data[row * row_size + col]; }
+	
+	double* getRow(int row) { return data.get() + row * row_size; }
+	
+	const double* getRow(int row) const { return data.get() + row * row_size; }
+
+	double* raw() { return data.get(); }
+	
+	matrix& operator=(const matrix& m) 
+	{
+		std::copy(m.data.get(), m.data.get() + m.n_rows * m.row_size, this->data.get());
+		return *this;
+	}
+	
+	friend std::ostream& operator<<(std::ostream& s, const matrix& m)
+	{
+		for (int r = 0; r < m.n_rows; r++) {
+			for (int c = 0; c < m.n_columns; c++)
+				s << m(r, c) << '\t';
+			s << '\n';
+		}
+		
+		return s;
+	}
+	
+	friend void swap(matrix& a, matrix& b)
+	{
+		std::swap(a.n_rows, b.n_rows);
+		std::swap(a.n_columns, b.n_columns);
+		std::swap(a.row_size, b.row_size);
+		a.data.swap(b.data);
+	}
+	
+	int n_rows, n_columns;
+	int row_size;
+
+private:
+	std::unique_ptr<double[]> data;
+};
+
+struct sparse_element_info
+{
+	int row, column;
+	double rating;
+};
+
+void calculate_dimesions()
+{
+	int min_diff = std::abs(nU / p - nI);
+	dimensions[0] = p;
+	dimensions[1] = 1;
+
+	for (int i = 2; i <= p; ++i) {
+		if (p % i == 0) {
+			int j = p / i;
+			int diff = std::abs(nU / j - nI / i);
+			if (diff < min_diff) {
+				diff = min_diff;
+				dimensions[0] = j;
+				dimensions[1] = i;
+			}
+		}
+	}
+}
+
+// Calculate topology and partitioning info
+void initialize_topology_info()
+{
+	// Create 2D cartesian grid
+    MPI_Comm_size(MPI_COMM_WORLD, &p);
+	calculate_dimesions();
+	int periodics[] = {0, 0};
+	MPI_Cart_create(MPI_COMM_WORLD, 2, dimensions, periodics, 1, &Cart_Comm);
+	MPI_Comm_rank(Cart_Comm, &id);
+	MPI_Cart_coords(Cart_Comm, id, 2, cart_coords);
+	int root_coords[] = {0, 0};
+	MPI_Cart_rank(Cart_Comm, root_coords, &root_id);
+	MPI_Comm_split(Cart_Comm, cart_coords[0], cart_coords[1], &Rows_Comm);
+	MPI_Comm_split(Cart_Comm, cart_coords[1], cart_coords[0], &Columns_Comm);
+}
+
+void initialize_partitioning_info()
+{
+	// Calculate number of rows a node manupulates
+	proc_rows.reset(new int[dimensions[0]]);
+	proc_row_offsets.reset(new int[dimensions[0]]);
+	int rows_per_proc = nU / dimensions[0];
+	int extra_rows = nU % dimensions[0];
+	proc_rows[0] = rows_per_proc + (extra_rows == 0 ? 0 : 1);
+	proc_row_offsets[0] = 0;
+	for(int i = 1; i < dimensions[0]; ++i) {
+		proc_rows[i] = rows_per_proc + (i >= extra_rows ? 0 : 1);
+		proc_row_offsets[i] = proc_row_offsets[i-1] + proc_rows[i-1];
+	}
+
+	// Calculate number of column a node manupulates
+	proc_columns.reset(new int[dimensions[1]]);
+	proc_column_offsets.reset(new int[dimensions[1]]);
+	int columns_per_proc = nI / dimensions[1];
+	int extra_columns = nI % dimensions[1];
+	proc_columns[0] = columns_per_proc + (extra_columns == 0 ? 0 : 1);
+	proc_column_offsets[0] = 0;
+	for(int j = 1; j < dimensions[1]; ++j) {
+		proc_columns[j] = columns_per_proc + (j >= extra_columns ? 0 : 1);
+		proc_column_offsets[j] = proc_column_offsets[j-1] + proc_columns[j-1]; 
+	}
+}
+
+// Creates a matrix from a file
+void parse_file_initialize_info(const char* filename, sparse_matrix& A)
+{
+	std::ifstream file(filename);
+	int n_elements;
+
+	if (file.fail()) {
+		std::cerr << "Failed to open file: " << filename << std::endl;
+		exit(1);
+	}
+		
+	file >> n_iter;
+	file >> learning_rate;
+	file >> nF;
+	file >> nU >> nI >> n_elements;
+		
+	initialize_topology_info();
+	initialize_partitioning_info();
+	
+	A.reset(proc_rows[cart_coords[0]], proc_columns[cart_coords[1]]);
+
+	int lower_row_limit = proc_row_offsets[cart_coords[0]];
+	int upper_row_limit = lower_row_limit + proc_rows[cart_coords[0]];
+	
+	int lower_column_limit = proc_column_offsets[cart_coords[1]];
+	int upper_column_limit = lower_column_limit + proc_columns[cart_coords[1]];
+
+	int row, column;
+	double rating;
+	for (int i = 0; i < n_elements; i++) {
+		// Read next element
+		file >> row >> column >> rating;
+
+		if (lower_row_limit <= row && row < upper_row_limit && 
+			lower_column_limit <= column && column < upper_column_limit)
+			A.add_element(row - lower_row_limit, column - lower_column_limit, rating);
+	}
+
+	file.close();
+}
+
+void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
+{	
+	#define RAND01 ((double) std::rand() / (double) RAND_MAX)
+	
+	if (id == root_id)
+	{
+		double* Lr;
+		for (int r = 0; r < L.n_rows; ++r) {
+			Lr = L.getRow(r);
+			for (int c = 0; c < nF; c++)
+				Lr[c] = RAND01 / (double) nF;
+		}
+		
+		double* bufferLr;
+		for (int coords[] = {1, 0}; coords[0] < dimensions[0]; ++coords[0]) {
+			for (int r = 0; r < proc_rows[coords[0]]; ++r) {
+				bufferLr = bufferL.getRow(r);
+				for (int c = 0; c < nF; ++c)
+					bufferLr[c] = RAND01 / (double) nF;
+				
+				MPI_Send(bufferLr, nF, MPI_DOUBLE, coords[0], DataTag, Columns_Comm);
+			}
+		}
+		
+		for (int r = 0; r < nF; ++r) {
+			for (int coords[] = {0, 0}; coords[1] < dimensions[1]; ++coords[1]) {
+				if (coords[1] == 0) 
+					for (int c = 0; c < proc_columns[0]; ++c)
+						Rt(c, r) = RAND01 / (double) nF;
+				else{
+					for (int c = 0; c < proc_columns[coords[1]]; ++c)
+						buffer[c] = RAND01 / (double) nF;
+					
+					MPI_Send(buffer, proc_columns[coords[1]], MPI_DOUBLE, coords[1], DataTag, Rows_Comm);
+				}
+			}
+		}
+	}
+	else if (cart_coords[0] == 0) {
+		MPI_Status status;
+		for (int r = 0; r < Rt.n_columns; ++r) {
+			MPI_Recv(buffer, Rt.n_rows, MPI_DOUBLE, 0, DataTag, Rows_Comm, &status);
+        	
+			for (int c = 0; c < Rt.n_rows; c++)
+            	Rt(c, r) = buffer[c];
+		}
+	}
+	else if (cart_coords[1] == 0) {
+		MPI_Status status;
+		for (int r = 0; r < L.n_rows; ++r)
+			MPI_Recv(L.getRow(r), nF, MPI_DOUBLE, 0, DataTag, Columns_Comm, &status);
+	}
+
+	MPI_Bcast(L.raw(), L.n_rows * L.row_size, MPI_DOUBLE, 0, Rows_Comm);
+	MPI_Bcast(Rt.raw(), Rt.n_rows * Rt.row_size, MPI_DOUBLE, 0, Columns_Comm);
+
+	#undef RAND01
+}
+
+void reduce_LR(matrix& L, matrix& bufferL, matrix& Rt, matrix& bufferRt)
+{
+	MPI_Request requests[2];
+	MPI_Status statuses[2];
+	int sizeL = L.n_rows * L.row_size;
+	int sizeRt = Rt.n_rows * Rt.row_size;
+	
+	MPI_Iallreduce(L.raw(), bufferL.raw(), sizeL, MPI_DOUBLE, MPI_SUM, Rows_Comm, requests);
+	MPI_Iallreduce(Rt.raw(), bufferRt.raw(), sizeRt, MPI_DOUBLE, MPI_SUM, Columns_Comm, requests + 1);
+	
+	MPI_Waitall(2, requests, statuses);
+}
+
+// Calculate B_ij
+double B(int i, int j, const matrix& L, const matrix& Rt)
+{
+	double elem = .0;
+	const double* Li = L.getRow(i);
+	const double* Rtj = Rt.getRow(j);
+	for(int k = 0; k < nF; k++)
+	{
+		elem += Li[k] * Rtj[k];
+	}
+
+	return elem;
+}
+
+void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matrix& oldRt)
+{
+	float deltaL, deltaR, temp;
+	swap(L, oldL);
+	swap(Rt, oldRt);
+	
+	#pragma omp parallel private(deltaL, deltaR, temp)
+	{
+		#pragma omp for nowait
+		for (int i = 0; i < L.n_rows; ++i) {
+			double* Li = L.getRow(i);
+			for (int j = 0; j < L.n_columns; ++j)
+				Li[j] = 0;
+		}
+		
+		#pragma omp for
+		for (int j = 0; j < Rt.n_rows; ++j) {
+			double* Rtj = Rt.getRow(j);
+			for (int i = 0; i < Rt.n_columns; ++i)
+				Rtj[i] = 0;
+		}
+
+		#pragma omp barrier
+
+		#pragma omp for nowait
+		for (int i = 0; i < L.n_rows; i++) {
+			int j;
+			auto& row = A.rows[i];
+			double* Li = L.getRow(i);
+			double* oldRtj;
+			for (auto& c : row) {
+				double rating = A.elements[c.elem_idx];
+				j = c.idx;
+				oldRtj = oldRt.getRow(j);
+				temp = rating - B(i, j, oldL, oldRt);
+				for (int k = 0; k < nF; k++) {
+					deltaL = -2 * temp * oldRtj[k];
+					Li[k] -= learning_rate * deltaL;
+				}
+			}
+		}
+		
+		#pragma omp for schedule(dynamic, 4)
+		for (int j = 0; j < Rt.n_rows; j++) {
+			int i;
+			auto& col = A.columns[j];
+			double* Rtj = Rt.getRow(j);
+			double* oldLi;
+			for (auto& r : col) {
+				double rating = A.elements[r.elem_idx];
+				i = r.idx;
+				oldLi = oldL.getRow(i);
+				temp = rating - B(i, j, oldL, oldRt);
+				for (int k = 0; k < nF; k++) {
+					deltaR = -2 * temp * oldLi[k];
+					Rtj[k] -= learning_rate * deltaR;
+				}
+			}
+		}
+	} // pragma omp parallel
+}
+
+void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
+{
+	struct result_pair
+	{
+		double value;
+		int position;
+	};
+	std::unique_ptr<result_pair[]> local_results(new result_pair[A.n_rows]);
+	std::unique_ptr<result_pair[]> global_results(new result_pair[A.n_rows]);
+	
+	#pragma omp parallel for schedule(static, 4)
+	for(int i = 0; i < A.n_rows; i++) {
+		auto& r = local_results[i];
+		r.value = -1;
+		r.position = -1;
+		auto it = A.rows[i].begin();
+		auto it_end = A.rows[i].end();
+		bool finished_row = (it == it_end);
+		
+		for(int j = 0; j < A.n_columns; j++) {
+			if (!finished_row && j == it->idx)
+			{
+				++it;
+				finished_row = (it == it_end);
+				continue;
+			}
+			
+			double b = B(i,j, L, Rt);
+			if (b > r.value) {
+				r.value = b;
+				r.position = proc_column_offsets[cart_coords[1]] + j;
+			}
+		}
+	}
+
+	MPI_Reduce(local_results.get(), global_results.get(), A.n_rows, MPI_DOUBLE_INT, MPI_MAXLOC, 0, Rows_Comm);
+
+	if (id == root_id) {
+		for (int i = 0; i < A.n_rows; ++i) std::cout << global_results[i].position << '\n';
+
+		int sender_id;
+		MPI_Status status;
+		for (int coords[] = {1, 0}; coords[0] < dimensions[0]; ++coords[0]) {
+			MPI_Cart_rank(Cart_Comm, coords, &sender_id);
+			MPI_Recv(global_results.get(), proc_rows[coords[0]], MPI_DOUBLE_INT, sender_id, DataTag, Cart_Comm, &status);
+
+			for (int i = 0; i < proc_rows[coords[0]]; ++i) std::cout << global_results[i].position << '\n';
+		}
+	}
+	else if (cart_coords[1] == 0) {
+		MPI_Send(global_results.get(), A.n_rows, MPI_DOUBLE_INT, root_id, DataTag, Cart_Comm);
+	}
+
+}
+
+int main(int argc, char* argv[])
+{
+	std::srand(0);
+	omp_set_num_threads(2);
+	sparse_matrix A;
+	double elapsed_time;
+	double comm_time = 0.;
+	double timer_tmp;
+	
+	MPI_Init(&argc, &argv);
+	elapsed_time = -MPI_Wtime();
+
+	parse_file_initialize_info(argv[1], A);
+
+	matrix L(proc_rows[cart_coords[0]], nF);
+	matrix oldL(proc_rows[cart_coords[0]], nF);
+	matrix bufferL(proc_rows[cart_coords[0]], nF);
+	
+	matrix Rt(proc_columns[cart_coords[1]], nF);
+	matrix oldRt(proc_columns[cart_coords[1]], nF);
+	matrix bufferRt(proc_columns[cart_coords[1]], nF);
+
+	std::unique_ptr<double[]> buffer(new double[proc_columns[0]]);
+	
+	initialize_LR(L, bufferL, Rt, buffer.get());
+	for (int i = 0; i < n_iter; i++)
+	{
+		update_LR(A, L, Rt, oldL, oldRt);
+
+		timer_tmp = -MPI_Wtime();
+		reduce_LR(L, bufferL, Rt, bufferRt);
+		timer_tmp += MPI_Wtime();
+		comm_time += timer_tmp;
+		
+		#pragma omp parallel
+		{	
+			#pragma omp for nowait
+			for (int i = 0; i < L.n_rows; ++i) {
+				double* Li = L.getRow(i);
+				double* oldLi = oldL.getRow(i);
+				double* bufferLi = bufferL.getRow(i);
+				for (int j = 0; j < L.n_columns; ++j) Li[j] = oldLi[j] + bufferLi[j];
+			}
+			
+			#pragma omp for
+			for (int j = 0; j < Rt.n_rows; ++j) {
+				double* Rtj = Rt.getRow(j);
+				double* oldRtj = oldRt.getRow(j);
+				double* bufferRtj = bufferRt.getRow(j);
+				for (int i = 0; i < Rt.n_columns; ++i) Rtj[i] = oldRtj[i] + bufferRtj[i];
+			}
+		}
+	}
+
+	result(A, L, Rt);
+	elapsed_time += MPI_Wtime();
+	
+	MPI_Barrier(Cart_Comm);
+	
+	if (id == root_id) {
+		std::cout << "\n-----------------------------\n";
+		std::cout << "Omp threads: " << omp_get_max_threads() << '\n';
+		std::cout << "Dimensions: " << dimensions[0] << ' ' << dimensions[1] << '\n';
+		std::cout << "Elapsed time: " << elapsed_time << '\n';
+		std::cout << "Communication: " << comm_time << std::endl;
+	}
+
+	MPI_Finalize();
+
+	return 0;
+}
