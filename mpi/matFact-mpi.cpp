@@ -393,7 +393,7 @@ void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
 		double value;
 		int position;
 	};
-	// Need to arrays to store results because MPI send and receive buffers need to be different
+	// Need 2 arrays to store results because MPI send and receive buffers need to be different
 	std::unique_ptr<result_pair[]> local_results(new result_pair[A.n_rows]);
 	std::unique_ptr<result_pair[]> global_results(new result_pair[A.n_rows]);
 	
