@@ -18,14 +18,27 @@ int nF;
 int nU;
 int nI;
 double learning_rate;
+
+// The id of the of this task, the id of the root task and the number of tasks
 int id, root_id, p;
+
+// The dimensions of the task grid
 int dimensions[2];
+
+// The coordinates on the grid of this task
 int cart_coords[2];
+
+// Arrays with the number of rows/columns and offsets to the full matrices
+// for each grid row/column number
 std::unique_ptr<int[]> proc_rows(nullptr);
 std::unique_ptr<int[]> proc_row_offsets(nullptr);
 std::unique_ptr<int[]> proc_columns(nullptr);
 std::unique_ptr<int[]> proc_column_offsets(nullptr);
+
+// Cartesian communicator
 MPI_Comm Cart_Comm;
+
+// Communicators for tasks on the same grid row/column
 MPI_Comm Rows_Comm, Columns_Comm;
 
 /** Sparse matrix type
@@ -143,6 +156,8 @@ struct sparse_element_info
 	double rating;
 };
 
+// Calculate dimensions so that the number of rows per taks is as
+// close as possible to the number of columns per task
 void calculate_dimesions()
 {
 	int min_diff = std::abs(nU / p - nI);
@@ -237,7 +252,8 @@ void parse_file_initialize_info(const char* filename, sparse_matrix& A)
 	for (int i = 0; i < n_elements; i++) {
 		// Read next element
 		file >> row >> column >> rating;
-
+		
+		// Keep element only if its row and column are in the range this task is responsible for
 		if (lower_row_limit <= row && row < upper_row_limit && 
 			lower_column_limit <= column && column < upper_column_limit)
 			A.add_element(row - lower_row_limit, column - lower_column_limit, rating);
@@ -246,12 +262,15 @@ void parse_file_initialize_info(const char* filename, sparse_matrix& A)
 	file.close();
 }
 
+// L and R are initialized by the root task so that they are the same as in the serial case
 void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
 {	
 	#define RAND01 ((double) std::rand() / (double) RAND_MAX)
 	
 	if (id == root_id)
 	{
+		// The first rows of row don't need to be sent to other task,
+		// since they are the ones the root task manages
 		double* Lr;
 		for (int r = 0; r < L.n_rows; ++r) {
 			Lr = L.getRow(r);
@@ -259,6 +278,10 @@ void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
 				Lr[c] = RAND01 / (double) nF;
 		}
 		
+		// Send the rows of L to the task with the corresponding row coordinate and
+		// column coordinate equal to 0
+		// Cannot send all rows at once because row_size in the matrix class may be
+		// different due to padding for cache alignment
 		double* bufferLr;
 		for (int coords[] = {1, 0}; coords[0] < dimensions[0]; ++coords[0]) {
 			for (int r = 0; r < proc_rows[coords[0]]; ++r) {
@@ -270,6 +293,7 @@ void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
 			}
 		}
 		
+		// Do the same for R (not Rt)
 		for (int r = 0; r < nF; ++r) {
 			for (int coords[] = {0, 0}; coords[1] < dimensions[1]; ++coords[1]) {
 				if (coords[1] == 0) 
@@ -284,6 +308,7 @@ void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
 			}
 		}
 	}
+	// If row coordinate is zero then receive Rt
 	else if (cart_coords[0] == 0) {
 		MPI_Status status;
 		for (int r = 0; r < Rt.n_columns; ++r) {
@@ -293,18 +318,21 @@ void initialize_LR(matrix& L, matrix& bufferL, matrix& Rt, double* buffer)
             	Rt(c, r) = buffer[c];
 		}
 	}
+	// If column coordinate is zero then receive L
 	else if (cart_coords[1] == 0) {
 		MPI_Status status;
 		for (int r = 0; r < L.n_rows; ++r)
 			MPI_Recv(L.getRow(r), nF, MPI_DOUBLE, 0, DataTag, Columns_Comm, &status);
 	}
 
+	// Broadcast to the rest of the grid
 	MPI_Bcast(L.raw(), L.n_rows * L.row_size, MPI_DOUBLE, 0, Rows_Comm);
 	MPI_Bcast(Rt.raw(), Rt.n_rows * Rt.row_size, MPI_DOUBLE, 0, Columns_Comm);
 
 	#undef RAND01
 }
 
+// Perform all-reduce operations across grid row and column to accumulate the updates
 void reduce_LR(matrix& L, matrix& bufferL, matrix& Rt, matrix& bufferRt)
 {
 	MPI_Request requests[2];
@@ -332,6 +360,7 @@ double B(int i, int j, const matrix& L, const matrix& Rt)
 	return elem;
 }
 
+// Update L and R using the elements of A this task is responsible for
 void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matrix& oldRt)
 {
 	float deltaL, deltaR, temp;
@@ -340,6 +369,9 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
 	
 	#pragma omp parallel private(deltaL, deltaR, temp)
 	{
+		// In contrast to the serial case the matrices need to be zeroed because
+		// otherwise the all-reduce operations would accumulate their elements
+		// multiple times
 		#pragma omp for nowait
 		for (int i = 0; i < L.n_rows; ++i) {
 			double* Li = L.getRow(i);
@@ -394,13 +426,16 @@ void update_LR(const sparse_matrix& A, matrix& L, matrix& Rt, matrix& oldL, matr
 	} // pragma omp parallel
 }
 
+// Compute and print result
 void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
 {
+	// Struct to hold the mac score and the index of the column it was achieved by
 	struct result_pair
 	{
 		double value;
 		int position;
 	};
+	// Need to arrays to store results because MPI send and receive buffers need to be different
 	std::unique_ptr<result_pair[]> local_results(new result_pair[A.n_rows]);
 	std::unique_ptr<result_pair[]> global_results(new result_pair[A.n_rows]);
 	
@@ -429,8 +464,10 @@ void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
 		}
 	}
 
+	// Reduce accross grid row
 	MPI_Reduce(local_results.get(), global_results.get(), A.n_rows, MPI_DOUBLE_INT, MPI_MAXLOC, 0, Rows_Comm);
 
+	// The root receives results and prints them
 	if (id == root_id) {
 		for (int i = 0; i < A.n_rows; ++i) std::cout << global_results[i].position << '\n';
 
@@ -443,6 +480,7 @@ void result(const sparse_matrix& A, const matrix& L, const matrix& Rt)
 			for (int i = 0; i < proc_rows[coords[0]]; ++i) std::cout << global_results[i].position << '\n';
 		}
 	}
+	// The tasks with grid column coordinate equal to 0 send their results to root
 	else if (cart_coords[1] == 0) {
 		MPI_Send(global_results.get(), A.n_rows, MPI_DOUBLE_INT, root_id, DataTag, Cart_Comm);
 	}
@@ -485,6 +523,7 @@ int main(int argc, char* argv[])
 		
 		#pragma omp parallel
 		{	
+			// After accumulating updates, compute L and Rt for next iteration
 			#pragma omp for nowait
 			for (int i = 0; i < L.n_rows; ++i) {
 				double* Li = L.getRow(i);
@@ -507,7 +546,9 @@ int main(int argc, char* argv[])
 	elapsed_time += MPI_Wtime();
 	
 	MPI_Barrier(Cart_Comm);
-	
+
+// Root prints info about runtime	
+/*
 	if (id == root_id) {
 		std::cout << "\n-----------------------------\n";
 		std::cout << "Omp threads: " << omp_get_max_threads() << '\n';
@@ -515,6 +556,7 @@ int main(int argc, char* argv[])
 		std::cout << "Elapsed time: " << elapsed_time << '\n';
 		std::cout << "Communication: " << comm_time << std::endl;
 	}
+*/
 
 	MPI_Finalize();
 
