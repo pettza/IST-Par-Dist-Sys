@@ -151,7 +151,7 @@ void calculate_dimesions()
 			int j = p / i;
 			int diff = std::abs(nU / j - nI / i);
 			if (diff < min_diff) {
-				diff = min_diff;
+				min_diff = diff;
 				dimensions[0] = j;
 				dimensions[1] = i;
 			}
